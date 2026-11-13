@@ -2,7 +2,6 @@ name: Import Android source and build
 on:
   push:
     branches: [main]
-    paths: ['source.tar.xz']
   workflow_dispatch:
 permissions:
   contents: write
