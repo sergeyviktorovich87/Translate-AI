@@ -1,337 +1,433 @@
 package ru.personal.lingua;
 
-import android.app.*;
-import android.content.*;
+import android.app.Activity;
+import android.app.AlertDialog;
+import android.app.Dialog;
+import android.content.ClipData;
+import android.content.ClipboardManager;
+import android.content.Intent;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.Message;
 import android.speech.RecognizerIntent;
 import android.speech.tts.TextToSpeech;
-import android.view.*;
-import android.webkit.*;
-import android.widget.*;
-import java.util.*;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import android.view.Gravity;
+import android.view.View;
+import android.view.ViewGroup;
+import android.webkit.CookieManager;
+import android.webkit.PermissionRequest;
+import android.webkit.WebChromeClient;
+import android.webkit.WebResourceError;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebSettings;
+import android.webkit.WebStorage;
+import android.webkit.WebView;
+import android.webkit.WebViewClient;
+import android.widget.Button;
+import android.widget.EditText;
+import android.widget.LinearLayout;
+import android.widget.TextView;
+import android.widget.Toast;
+import java.util.ArrayList;
+import java.util.Locale;
+import org.json.JSONObject;
 
-/** Personal Android shell: ChatGPT website + native speech translation through official account OAuth. */
+/**
+ * Personal ChatGPT website shell. ONE WebView cookie session, no API or OAuth tokens.
+ * User-triggered prompt preparation only; answers remain on the ChatGPT website.
+ * Does not extract ChatGPT responses or access cookies from JavaScript.
+ */
 public final class MainActivity extends Activity {
-    private static final int REQUEST_VOICE = 200;
-    private static final int REQUEST_FILES = 201;
-    private final ExecutorService background = Executors.newSingleThreadExecutor();
-    private ChatAuth auth;
-    private WebView web;
-    private FrameLayout pages;
-    private LinearLayout webPane;
-    private ScrollView translatorPane;
-    private EditText input, result;
-    private TextView accountStatus, busyLabel;
-    private Button directionButton, translateButton, loginButton;
-    private ValueCallback<Uri[]> fileCallback;
+    private static final int VOICE_REQUEST = 123;
+    private final Handler ui = new Handler(Looper.getMainLooper());
+    private WebView web, popup;
+    private Dialog popupDialog;
+    private LinearLayout translatorControls;
+    private EditText source;
+    private Button directionButton;
     private TextToSpeech tts;
-    private boolean ttsReady = false, ruToZh = true, isTranslator = false;
+    private boolean ttsReady, ruToZh = true, translatorMode = true;
+    private String lastNavigationTag = "";
 
-    @Override public void onCreate(Bundle state) {
-        super.onCreate(state);
-        getWindow().setStatusBarColor(Color.rgb(245,246,248));
-        getWindow().setNavigationBarColor(Color.rgb(245,246,248));
-        auth = new ChatAuth(this);
+    @Override public void onCreate(Bundle savedState) {
+        super.onCreate(savedState);
+        getWindow().setStatusBarColor(Color.rgb(245, 247, 250));
+        getWindow().setNavigationBarColor(Color.rgb(245, 247, 250));
+        getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR);
         tts = new TextToSpeech(this, status -> ttsReady = status == TextToSpeech.SUCCESS);
-        Thread.setDefaultUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler() {
-            final Thread.UncaughtExceptionHandler previous = Thread.getDefaultUncaughtExceptionHandler();
-            @Override public void uncaughtException(Thread thread, Throwable error) {
-                // Never log throwable messages or sensitive UI content.
-                LocalLog.event(MainActivity.this, "crash_" + error.getClass().getSimpleName());
-                if (previous != null) previous.uncaughtException(thread, error);
-            }
-        });
         buildUi();
-        showTranslator(false);
-        LocalLog.event(this, "app_started");
+        LocalLog.event(this, "app_started_v0_2");
+        web.loadUrl("https://chatgpt.com/");
     }
 
     private void buildUi() {
-        LinearLayout layout = column(); layout.setBackgroundColor(Color.rgb(248,249,251));
-        setContentView(layout);
-        LinearLayout tabs = row(); tabs.setPadding(dp(8), dp(8), dp(8), dp(4));
-        Button chat = button("🌐 ChatGPT"); chat.setOnClickListener(v -> showTranslator(false));
-        Button translator = button("🎙 Переводчик"); translator.setOnClickListener(v -> showTranslator(true));
-        tabs.addView(chat, new LinearLayout.LayoutParams(0, dp(48), 1));
-        tabs.addView(translator, new LinearLayout.LayoutParams(0, dp(48), 1));
-        layout.addView(tabs);
-        pages = new FrameLayout(this);
-        layout.addView(pages, new LinearLayout.LayoutParams(-1, 0, 1));
-        buildWebPage(); buildTranslatorPage();
+        LinearLayout root = column();
+        root.setBackgroundColor(Color.rgb(247, 248, 252));
+        setContentView(root);
 
-        LinearLayout bar = row(); bar.setPadding(dp(6), dp(4), dp(6), dp(6));
-        Button voiceRussian = button("🎙 RU");
-        Button voiceChinese = button("🎙 中文");
-        Button copy = button("📋");
-        Button speaker = button("🔊");
-        voiceRussian.setOnClickListener(v -> {ruToZh = true; showTranslator(true); updateDirection(); startRecognition();});
-        voiceChinese.setOnClickListener(v -> {ruToZh = false; showTranslator(true); updateDirection(); startRecognition();});
-        copy.setOnClickListener(v -> copyResult());
-        speaker.setOnClickListener(v -> speak());
-        for (Button b : new Button[] {voiceRussian, voiceChinese, copy, speaker})
-            bar.addView(b, new LinearLayout.LayoutParams(0, dp(48), 1));
-        layout.addView(bar);
-    }
+        LinearLayout tabs = row();
+        tabs.setPadding(dp(6), dp(6), dp(6), 0);
+        Button translator = button("🌐 Переводчик");
+        Button chat = button("💬 ChatGPT");
+        translator.setOnClickListener(v -> showMode(true));
+        chat.setOnClickListener(v -> showMode(false));
+        tabs.addView(translator, new LinearLayout.LayoutParams(0, dp(49), 1));
+        tabs.addView(chat, new LinearLayout.LayoutParams(0, dp(49), 1));
+        root.addView(tabs);
 
-    private void buildWebPage() {
-        webPane = column();
-        TextView hint = new TextView(this);
-        hint.setText("Встроенный ChatGPT: вход через Google может не работать. " +
-                "Для надёжного входа открой ChatGPT в системном браузере. " +
-                "Cookies браузера не передаются в оболочку.");
-        hint.setTextSize(12); hint.setTextColor(Color.DKGRAY);
-        hint.setPadding(dp(12), dp(5), dp(12), dp(5));
-        webPane.addView(hint);
-        LinearLayout bar = row(); bar.setPadding(dp(8), 0, dp(8), 0);
-        Button browser = button("Открыть в браузере");
-        browser.setOnClickListener(v -> { LocalLog.event(this, "web_open_browser"); openExternal("https://chatgpt.com/"); });
-        Button resetLogin = button("Сбросить вход");
-        resetLogin.setOnClickListener(v -> resetWebLogin());
-        bar.addView(browser, new LinearLayout.LayoutParams(0, dp(48), 1));
-        bar.addView(resetLogin, new LinearLayout.LayoutParams(0, dp(48), 1));
-        webPane.addView(bar);
-        web = new WebView(this);
-        WebSettings s = web.getSettings();
-        s.setJavaScriptEnabled(true); s.setDomStorageEnabled(true);
-        s.setAllowFileAccess(false); s.setAllowContentAccess(true); // Picker-granted content:// uploads only
-        s.setAllowFileAccessFromFileURLs(false); s.setAllowUniversalAccessFromFileURLs(false);
-        s.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
-        s.setJavaScriptCanOpenWindowsAutomatically(false);
-        s.setSafeBrowsingEnabled(true);
-        CookieManager.getInstance().setAcceptCookie(true);
-        // Required for cross-domain ChatGPT sign-in inside this WebView.
-        // The WebView's cookies remain separate from Chrome.
-        CookieManager.getInstance().setAcceptThirdPartyCookies(web, true);
-        web.setWebViewClient(new WebViewClient() {
-            @Override public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
-                Uri u = request.getUrl();
-                String scheme = u.getScheme(), host = u.getHost();
-                if (scheme == null || host == null || !scheme.equalsIgnoreCase("https")) return true;
-                if (host.equals("chatgpt.com") || host.endsWith(".chatgpt.com") ||
-                    host.equals("openai.com") || host.endsWith(".openai.com")) return false;
-                if (request.isForMainFrame()) {
-                    if (host.equals("accounts.google.com") ||
-                        host.equals("appleid.apple.com") ||
-                        host.equals("login.microsoftonline.com")) {
-                        LocalLog.event(MainActivity.this, "external_identity_provider");
-                        showMessage("Внешний вход не переносится в WebView. Для ChatGPT используй браузер.");
-                    }
-                    openExternal(u.toString());
-                }
-                return true;
-            }
+        translatorControls = column();
+        translatorControls.setPadding(dp(10), dp(2), dp(10), dp(4));
+        TextView note = label("Один вход в ChatGPT. Ответ показывается в чате ниже.", 12);
+        translatorControls.addView(note);
+        directionButton = button("Русский → 中文  ⇄");
+        directionButton.setOnClickListener(v -> {
+            ruToZh = !ruToZh;
+            directionButton.setText(ruToZh ? "Русский → 中文  ⇄" : "中文 → Русский  ⇄");
+            LocalLog.event(this, "translation_direction_changed");
         });
-        web.setWebChromeClient(new WebChromeClient() {
-            @Override public boolean onShowFileChooser(WebView w, ValueCallback<Uri[]> callback,
-                                                         FileChooserParams params) {
-                if (fileCallback != null) fileCallback.onReceiveValue(null);
-                fileCallback = callback;
-                try { startActivityForResult(params.createIntent(), REQUEST_FILES); }
-                catch (Exception ex) {fileCallback = null; callback.onReceiveValue(null); return false;}
-                return true;
-            }
-            @Override public void onPermissionRequest(PermissionRequest request) {
-                // No automatic camera/mic permission grant to web content.
-                runOnUiThread(request::deny);
-            }
-        });
-        web.loadUrl("https://chatgpt.com/");
-        webPane.addView(web, new LinearLayout.LayoutParams(-1, 0, 1));
-        pages.addView(webPane);
-    }
+        translatorControls.addView(directionButton, new LinearLayout.LayoutParams(-1, dp(44)));
 
-    private void resetWebLogin() {
-        new AlertDialog.Builder(this)
-            .setTitle("Сбросить вход в веб-вкладке?")
-            .setMessage("Очистятся только данные WebView этого приложения. Сессия Chrome и аккаунт ChatGPT сохранятся.")
-            .setNegativeButton("Отмена", null)
-            .setPositiveButton("Очистить", (dialog, which) ->
-                CookieManager.getInstance().removeAllCookies(cleared ->
-                    runOnUiThread(() -> {
-                        web.clearCache(true);
-                        WebStorage.getInstance().deleteAllData();
-                        web.loadUrl("https://chatgpt.com/");
-                        LocalLog.event(this, "web_login_reset");
-                        showMessage("Данные веб-вкладки очищены");
-                    })))
-            .show();
-    }
+        source = new EditText(this);
+        source.setTextSize(17);
+        source.setHint("Напиши или продиктуй фразу…");
+        source.setSingleLine(false);
+        source.setMaxLines(4);
+        source.setMinLines(2);
+        translatorControls.addView(source, new LinearLayout.LayoutParams(-1, dp(95)));
 
-    private void buildTranslatorPage() {
-        translatorPane = new ScrollView(this); translatorPane.setFillViewport(true);
-        LinearLayout inner = column(); inner.setPadding(dp(16), dp(10), dp(16), dp(20));
-        translatorPane.addView(inner);
-        TextView title = label("Личный голосовой переводчик", 23, Color.BLACK); inner.addView(title);
-        accountStatus = label(auth.accountStatus(), 13, Color.DKGRAY); inner.addView(accountStatus);
-        loginButton = button("Подключить аккаунт ChatGPT");
-        loginButton.setOnClickListener(v -> {
-            loginButton.setEnabled(false);
-            accountStatus.setText("Авторизация открыта в браузере…");
-            auth.startLogin((ok, message) -> {
-                loginButton.setEnabled(true);
-                accountStatus.setText(ok ? auth.accountStatus() : message);
-                if (!ok) showMessage(message);
-            });
-        });
-        inner.addView(loginButton, new LinearLayout.LayoutParams(-1, dp(50)));
-        TextView note = label("Для перевода разреши приложению использовать свой тариф ChatGPT. " +
-                "Существующие чаты через этот доступ не читаются.", 12, Color.GRAY);
-        inner.addView(note);
-        directionButton = button("Русский → 简体中文  ⇄");
-        directionButton.setOnClickListener(v -> { ruToZh = !ruToZh; updateDirection(); });
-        inner.addView(directionButton, new LinearLayout.LayoutParams(-1, dp(50)));
-        inner.addView(label("Исходный текст", 16, Color.DKGRAY));
-        input = new EditText(this); input.setTextSize(19); input.setGravity(Gravity.TOP);
-        input.setSingleLine(false); input.setMinLines(3); input.setMaxLines(8);
-        input.setHint("Говори или напечатай фразу…");
-        inner.addView(input, new LinearLayout.LayoutParams(-1, dp(140)));
-        LinearLayout controls = row();
-        Button mic = button("🎙 Записать"); mic.setOnClickListener(v -> startRecognition());
-        translateButton = button("Перевести"); translateButton.setOnClickListener(v -> translate());
-        controls.addView(mic, new LinearLayout.LayoutParams(0, dp(54), 1));
-        controls.addView(translateButton, new LinearLayout.LayoutParams(0, dp(54), 1));
-        inner.addView(controls);
-        busyLabel = label("", 13, Color.DKGRAY); inner.addView(busyLabel);
-        inner.addView(label("Перевод и пиньинь", 16, Color.DKGRAY));
-        result = new EditText(this); result.setTextSize(20); result.setGravity(Gravity.TOP);
-        result.setMinLines(4); result.setSingleLine(false);
-        result.setHint("Здесь появится результат");
-        inner.addView(result, new LinearLayout.LayoutParams(-1, dp(180)));
         LinearLayout actions = row();
-        Button copy = button("📋 Копировать"); copy.setOnClickListener(v -> copyResult());
-        Button speak = button("🔊 Прослушать"); speak.setOnClickListener(v -> speak());
-        actions.addView(copy, new LinearLayout.LayoutParams(0, dp(52), 1));
-        actions.addView(speak, new LinearLayout.LayoutParams(0, dp(52), 1));
-        inner.addView(actions);
-        LinearLayout extra = row();
-        Button logout = button("Отключить аккаунт");
-        logout.setOnClickListener(v -> {
-            accountStatus.setText("Отключение…");
-            auth.signOut((ok, text) -> { accountStatus.setText(auth.accountStatus()); showMessage(text); });
+        Button microphone = button("🎙 Голос");
+        microphone.setOnClickListener(v -> startVoice());
+        Button translate = button("Перевести в ChatGPT");
+        translate.setOnClickListener(v -> preparePrompt());
+        actions.addView(microphone, new LinearLayout.LayoutParams(0, dp(48), 1));
+        actions.addView(translate, new LinearLayout.LayoutParams(0, dp(48), 2));
+        translatorControls.addView(actions);
+        root.addView(translatorControls);
+
+        // SAME WebView instance is retained between modes: one account, one cookie jar.
+        web = new WebView(this);
+        configureWebView(web, false);
+        web.setWebViewClient(new SiteClient(false));
+        web.setWebChromeClient(new BrowserChrome());
+        root.addView(web, new LinearLayout.LayoutParams(-1, 0, 1));
+
+        LinearLayout bottom = row();
+        bottom.setPadding(dp(5), dp(2), dp(5), dp(5));
+        Button copy = button("📋 Текст");
+        copy.setOnClickListener(v -> {
+            String text = source.getText().toString();
+            if (text.trim().isEmpty()) {toast("Нет текста для копирования"); return;}
+            copyText(text);
         });
-        Button logs = button("Логи теста"); logs.setOnClickListener(v -> exportLogs());
-        extra.addView(logout, new LinearLayout.LayoutParams(0, dp(50), 1));
-        extra.addView(logs, new LinearLayout.LayoutParams(0, dp(50), 1));
-        inner.addView(extra);
-        pages.addView(translatorPane);
+        Button speaker = button("🔊 Перевод");
+        speaker.setOnClickListener(v -> speakClipboard());
+        Button logs = button("Логи");
+        logs.setOnClickListener(v -> exportLogs());
+        Button reload = button("↻");
+        reload.setOnClickListener(v -> web.reload());
+        bottom.addView(copy, new LinearLayout.LayoutParams(0, dp(46), 1));
+        bottom.addView(speaker, new LinearLayout.LayoutParams(0, dp(46), 1));
+        bottom.addView(logs, new LinearLayout.LayoutParams(0, dp(46), 1));
+        bottom.addView(reload, new LinearLayout.LayoutParams(0, dp(46), 0.55f));
+        root.addView(bottom);
     }
 
-    private void updateDirection() {
-        directionButton.setText(ruToZh ? "Русский → 简体中文  ⇄" : "简体中文 → Русский  ⇄");
+    private void showMode(boolean translator) {
+        translatorMode = translator;
+        translatorControls.setVisibility(translator ? View.VISIBLE : View.GONE);
+        // Do not reload: reloading can interrupt an authentication redirect.
+        LocalLog.event(this, translator ? "show_translator" : "show_chat");
     }
-    private void showTranslator(boolean show) {
-        isTranslator = show;
-        translatorPane.setVisibility(show ? View.VISIBLE : View.GONE);
-        webPane.setVisibility(show ? View.GONE : View.VISIBLE);
-        if (show) accountStatus.setText(auth.accountStatus());
+
+    private void configureWebView(WebView view, boolean loginPopup) {
+        WebSettings settings = view.getSettings();
+        settings.setJavaScriptEnabled(true);
+        settings.setDomStorageEnabled(true);
+        settings.setAllowFileAccess(false);
+        settings.setAllowContentAccess(false);
+        settings.setAllowFileAccessFromFileURLs(false);
+        settings.setAllowUniversalAccessFromFileURLs(false);
+        settings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
+        settings.setSafeBrowsingEnabled(true);
+        settings.setSupportMultipleWindows(!loginPopup);
+        settings.setJavaScriptCanOpenWindowsAutomatically(!loginPopup);
+        // Remove Android WebView marker; preserve browser/Android Chrome version.
+        String ua = settings.getUserAgentString();
+        if (ua != null) settings.setUserAgentString(ua.replace("; wv", ""));
+        CookieManager cm = CookieManager.getInstance();
+        cm.setAcceptCookie(true);
+        cm.setAcceptThirdPartyCookies(view, loginPopup);
     }
-    private void startRecognition() {
+
+    private boolean isChatHost(String host) {
+        return host != null &&
+            (host.equals("chatgpt.com") || host.endsWith(".chatgpt.com"));
+    }
+    private boolean isSiteHost(String host) {
+        return isChatHost(host) || domain(host, "openai.com");
+    }
+    private boolean domain(String host, String suffix) {
+        return host != null && (host.equals(suffix) || host.endsWith("." + suffix));
+    }
+    private boolean isLoginHost(String host) {
+        // Google auth hops stay in same WebView cookie partition.
+        return domain(host, "google.com")
+            || domain(host, "googleusercontent.com")
+            || domain(host, "gstatic.com")
+            || host != null && (host.equals("accounts.youtube.com")
+                 || host.startsWith("accounts.google.")
+                 || domain(host, "microsoftonline.com")
+                 || host.equals("appleid.apple.com"));
+    }
+
+    private final class SiteClient extends WebViewClient {
+        private final boolean isPopup;
+        SiteClient(boolean popupClient) {isPopup = popupClient;}
+        @Override public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+            Uri uri = request.getUrl();
+            String scheme = uri.getScheme();
+            String host = uri.getHost();
+            if ("about".equals(scheme) || "blob".equals(scheme) || "data".equals(scheme))
+                return false;
+            if (!"https".equalsIgnoreCase(scheme)) return true;
+            if (!request.isForMainFrame()) return false;
+            if (isSiteHost(host) || isLoginHost(host)) return false;
+            if (isPopup) {
+                closePopup(false);
+            }
+            external(uri);
+            return true;
+        }
+        @Override public void onPageFinished(WebView view, String url) {
+            Uri uri;
+            try {uri = Uri.parse(url);} catch (Exception e) {return;}
+            String host = uri.getHost();
+            String navTag = isChatHost(host) ? "chat_page_loaded" :
+                    isLoginHost(host) || domain(host, "auth.openai.com") ?
+                    "auth_page_loaded" : "other_page_loaded";
+            if (!navTag.equals(lastNavigationTag)) {
+                LocalLog.event(MainActivity.this, (isPopup ? "popup_" : "main_") + navTag);
+                lastNavigationTag = navTag;
+            }
+            // Some sign-in providers open a new window; it shares cookies with the main WebView.
+            if (isPopup && isChatHost(host) && !uri.getPath().startsWith("/auth/")) {
+                LocalLog.event(MainActivity.this, "popup_login_returned");
+                ui.postDelayed(() -> closePopup(true), 650);
+            }
+        }
+        @Override public void onReceivedError(WebView view, WebResourceRequest request,
+                                              WebResourceError error) {
+            if (request.isForMainFrame()) {
+                LocalLog.event(MainActivity.this, "web_network_error_" + error.getErrorCode());
+                toast("Страница недоступна. Проверь соединение и DNS.");
+            }
+        }
+    }
+
+    private final class BrowserChrome extends WebChromeClient {
+        @Override public boolean onCreateWindow(WebView view, boolean isDialog,
+                                                 boolean isUserGesture, Message resultMsg) {
+            if (!isUserGesture || popup != null) return false;
+            LocalLog.event(MainActivity.this, "auth_popup_created");
+            popup = new WebView(MainActivity.this);
+            configureWebView(popup, true);
+            popup.setWebViewClient(new SiteClient(true));
+            popup.setWebChromeClient(new WebChromeClient() {
+                @Override public void onCloseWindow(WebView window) {closePopup(true);}
+                @Override public void onPermissionRequest(PermissionRequest request) {
+                    runOnUiThread(request::deny);
+                }
+            });
+            popupDialog = new Dialog(MainActivity.this);
+            popupDialog.setContentView(popup);
+            popupDialog.setOnDismissListener(d -> {
+                // A posted destroy avoids destroying WebView mid-WebKit callback.
+                WebView old = popup;
+                popup = null;
+                popupDialog = null;
+                if (old != null) ui.post(old::destroy);
+                CookieManager.getInstance().flush();
+            });
+            popupDialog.show();
+            if (popupDialog.getWindow() != null) {
+                popupDialog.getWindow().setLayout(ViewGroup.LayoutParams.MATCH_PARENT,
+                                                  ViewGroup.LayoutParams.MATCH_PARENT);
+            }
+            WebView.WebViewTransport transport = (WebView.WebViewTransport) resultMsg.obj;
+            transport.setWebView(popup);
+            resultMsg.sendToTarget();
+            return true;
+        }
+        @Override public void onCloseWindow(WebView window) {closePopup(true);}
+        @Override public void onPermissionRequest(PermissionRequest request) {
+            // Do not grant web microphone/camera permissions automatically.
+            runOnUiThread(request::deny);
+        }
+    }
+
+    private void closePopup(boolean refreshMain) {
+        ui.post(() -> {
+            if (popupDialog != null) popupDialog.dismiss();
+            if (refreshMain) {
+                CookieManager.getInstance().flush();
+                web.loadUrl("https://chatgpt.com/");
+            }
+        });
+    }
+
+    private void preparePrompt() {
+        String message = source.getText().toString().trim();
+        if (message.isEmpty()) {toast("Сначала напиши или продиктуй фразу"); return;}
+        String instruction = ruToZh
+            ? "Переведи с русского на упрощённый китайский. Сначала дай китайский перевод, "
+              + "затем пиньинь с тонами, затем краткое объяснение по-русски. "
+              + "Без вступления и лишнего текста.\nИсходный текст:\n"
+            : "Переведи с китайского на русский. Сначала дай русский перевод, "
+              + "затем пиньинь оригинала с тонами, затем краткое объяснение по-русски. "
+              + "Без вступления и лишнего текста.\nИсходный текст:\n";
+        String fullPrompt = instruction + message;
+        copyTextQuiet(fullPrompt);
+        LocalLog.event(this, "prompt_prepared");
+        Uri page = null;
+        try {page = Uri.parse(web.getUrl());} catch (Exception ignored) {}
+        if (page == null || !isChatHost(page.getHost())) {
+            toast("Запрос скопирован. Войди в ChatGPT, вставь текст и отправь.");
+            return;
+        }
+        // User-triggered convenience: prefill the site's input. No response scraping.
+        String js = "(function() {"
+          + "const box=document.querySelector('#prompt-textarea')"
+          + "||document.querySelector('div[contenteditable=\"true\"][role=\"textbox\"]')"
+          + "||document.querySelector('div[contenteditable=\"true\"]')"
+          + "||document.querySelector('textarea');"
+          + "if(!box)return false;"
+          + "const v=" + JSONObject.quote(fullPrompt) + ";"
+          + "box.focus();"
+          + "if(box.tagName==='TEXTAREA'){const d=Object.getOwnPropertyDescriptor("
+          + "HTMLTextAreaElement.prototype,'value');d.set.call(box,v);}"
+          + "else {box.textContent=v;}"
+          + "box.dispatchEvent(new Event('input',{bubbles:true}));"
+          + "return true;})()";
+        web.evaluateJavascript(js, ok -> {
+            if ("true".equals(ok)) {
+                LocalLog.event(this, "prompt_prefilled");
+                toast("Текст готов в ChatGPT. Нажми отправку.");
+            } else {
+                LocalLog.event(this, "prompt_prefill_unavailable");
+                toast("Запрос скопирован. Вставь его в ChatGPT и отправь.");
+            }
+        });
+    }
+
+    private void startVoice() {
         try {
-            Intent i = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
-            i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
-            i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, ruToZh ? "ru-RU" : "zh-CN");
-            i.putExtra(RecognizerIntent.EXTRA_PROMPT, "Говорите…");
-            startActivityForResult(i, REQUEST_VOICE);
-            LocalLog.event(this, "speech_launch");
+            Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+            intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                            RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+            intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, ruToZh ? "ru-RU" : "zh-CN");
+            startActivityForResult(intent, VOICE_REQUEST);
+            LocalLog.event(this, "speech_started");
         } catch (Exception e) {
             LocalLog.event(this, "speech_unavailable");
-            showMessage("На телефоне не найден сервис распознавания речи.");
+            toast("На телефоне нет распознавания речи");
         }
     }
-    private void translate() {
-        String source = input.getText().toString().trim();
-        if (source.isEmpty()) { showMessage("Сначала введи текст или нажми микрофон."); return; }
-        translateButton.setEnabled(false); busyLabel.setText("Переводим…");
-        LocalLog.event(this, "translation_start");
-        final boolean direction = ruToZh;
-        background.execute(() -> {
-            try {
-                String translated = auth.translate(direction, source);
-                runOnUiThread(() -> {
-                    translateButton.setEnabled(true); busyLabel.setText("Готово");
-                    result.setText(translated);
-                });
-            } catch (Exception e) {
-                LocalLog.event(this, "translation_error_" + e.getClass().getSimpleName());
-                runOnUiThread(() -> {
-                    translateButton.setEnabled(true); busyLabel.setText("Ошибка перевода");
-                    showMessage("Перевод не выполнен: " + ChatAuth.safeError(e));
-                });
+
+    @Override protected void onActivityResult(int req, int result, Intent intent) {
+        super.onActivityResult(req, result, intent);
+        if (req == VOICE_REQUEST && result == RESULT_OK && intent != null) {
+            ArrayList<String> words = intent.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS);
+            if (words != null && !words.isEmpty()) {
+                source.setText(words.get(0));
+                LocalLog.event(this, "speech_completed");
+                preparePrompt();
             }
-        });
+        }
     }
-    private void copyResult() {
-        String text = result.getText().toString();
-        if (text.isEmpty()) { showMessage("Сначала переведи фразу."); return; }
-        ClipboardManager cb = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
-        cb.setPrimaryClip(ClipData.newPlainText("Перевод", text));
-        showMessage("Скопировано");
-    }
-    private void speak() {
-        String text = ChatAuth.targetForSpeech(result.getText().toString());
-        if (text.isEmpty()) { showMessage("Нет текста для озвучивания."); return; }
-        if (!ttsReady) { showMessage("Системный синтез речи недоступен."); return; }
+
+    private void speakClipboard() {
+        ClipboardManager manager = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+        if (manager == null || !manager.hasPrimaryClip() || manager.getPrimaryClip() == null
+                || manager.getPrimaryClip().getItemCount() == 0) {
+            toast("Сначала скопируй перевод в ChatGPT"); return;
+        }
+        CharSequence text = manager.getPrimaryClip().getItemAt(0).coerceToText(this);
+        if (text == null || text.length() == 0) {
+            toast("Буфер обмена пуст"); return;
+        }
+        if (!ttsReady) {toast("Озвучивание пока недоступно"); return;}
         int status = tts.setLanguage(ruToZh ? Locale.SIMPLIFIED_CHINESE : new Locale("ru", "RU"));
         if (status == TextToSpeech.LANG_MISSING_DATA || status == TextToSpeech.LANG_NOT_SUPPORTED) {
-            showMessage("Нужно установить системный голос выбранного языка."); return;
+            toast("Установи голос выбранного языка в настройках Android"); return;
         }
-        tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "translation");
+        tts.speak(text.toString(), TextToSpeech.QUEUE_FLUSH, null, "translate_ai_clipboard");
+        LocalLog.event(this, "speech_playback_started");
     }
-    private void exportLogs() {
-        Intent i = new Intent(Intent.ACTION_SEND);
-        i.setType("text/plain");
-        i.putExtra(Intent.EXTRA_SUBJECT, "Личный переводчик: тестовые логи");
-        i.putExtra(Intent.EXTRA_TEXT, LocalLog.read(this));
-        startActivity(Intent.createChooser(i, "Отправить логи"));
-    }
-    private void openExternal(String url) {
-        try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url))); }
-        catch (Exception e) { showMessage("Браузер не найден"); }
-    }
-    private void showMessage(String s) { Toast.makeText(this, s, Toast.LENGTH_LONG).show(); }
-    private LinearLayout row() {
-        LinearLayout v = new LinearLayout(this); v.setOrientation(LinearLayout.HORIZONTAL);
-        v.setGravity(Gravity.CENTER_VERTICAL); return v;
-    }
-    private LinearLayout column() { LinearLayout v = new LinearLayout(this); v.setOrientation(LinearLayout.VERTICAL); return v; }
-    private Button button(String value) { Button b = new Button(this); b.setText(value); b.setTextSize(13); b.setAllCaps(false); return b; }
-    private TextView label(String value, int size, int color) {
-        TextView view = new TextView(this); view.setText(value); view.setTextSize(size);
-        view.setTextColor(color); view.setPadding(dp(4), dp(10), dp(4), dp(9)); return view;
-    }
-    private int dp(int n) { return Math.round(n * getResources().getDisplayMetrics().density); }
 
-    @Override protected void onActivityResult(int request, int resultCode, Intent data) {
-        super.onActivityResult(request, resultCode, data);
-        if (request == REQUEST_FILES) {
-            if (fileCallback != null) {
-                fileCallback.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(resultCode, data));
-                fileCallback = null;
-            }
-        } else if (request == REQUEST_VOICE && resultCode == RESULT_OK && data != null) {
-            ArrayList<String> results = data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS);
-            if (results != null && !results.isEmpty()) {
-                showTranslator(true); input.setText(results.get(0));
-                LocalLog.event(this, "speech_success");
-                // Voice is a one-tap translation action after the user has authorized an account.
-                translate();
-            }
-        }
+    private void copyTextQuiet(String text) {
+        ClipboardManager manager = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+        if (manager != null) manager.setPrimaryClip(ClipData.newPlainText("Translate AI", text));
     }
+    private void copyText(String text) {copyTextQuiet(text); toast("Скопировано");}
+
+    private void exportLogs() {
+        Intent share = new Intent(Intent.ACTION_SEND);
+        share.setType("text/plain");
+        share.putExtra(Intent.EXTRA_SUBJECT, "Translate AI: диагностические события");
+        share.putExtra(Intent.EXTRA_TEXT, LocalLog.read(this));
+        startActivity(Intent.createChooser(share, "Отправить логи теста"));
+    }
+    private void external(Uri uri) {
+        try {
+            Intent i = new Intent(Intent.ACTION_VIEW, uri);
+            startActivity(i);
+        } catch (Exception e) {toast("Браузер не найден");}
+    }
+    private void toast(String text) {Toast.makeText(this, text, Toast.LENGTH_LONG).show();}
+    private LinearLayout row() {
+        LinearLayout l = new LinearLayout(this);
+        l.setOrientation(LinearLayout.HORIZONTAL);
+        l.setGravity(Gravity.CENTER_VERTICAL);
+        return l;
+    }
+    private LinearLayout column() {
+        LinearLayout l = new LinearLayout(this);
+        l.setOrientation(LinearLayout.VERTICAL);
+        return l;
+    }
+    private TextView label(String text, int size) {
+        TextView t = new TextView(this);
+        t.setText(text);
+        t.setTextSize(size);
+        t.setTextColor(Color.DKGRAY);
+        t.setPadding(dp(6), dp(5), dp(6), dp(6));
+        return t;
+    }
+    private Button button(String text) {
+        Button b = new Button(this);
+        b.setText(text);
+        b.setTextSize(12);
+        b.setAllCaps(false);
+        return b;
+    }
+    private int dp(int n) {return Math.round(n * getResources().getDisplayMetrics().density);}
     @Override public void onBackPressed() {
-        if (!isTranslator && web.canGoBack()) web.goBack();
-        else if (isTranslator) showTranslator(false);
-        else super.onBackPressed();
+        if (popupDialog != null) {closePopup(false); return;}
+        if (web.canGoBack()) {web.goBack(); return;}
+        super.onBackPressed();
     }
-    @Override protected void onPause() { super.onPause(); CookieManager.getInstance().flush(); }
+    @Override protected void onPause() {
+        super.onPause();
+        CookieManager.getInstance().flush();
+    }
     @Override protected void onDestroy() {
-        auth.destroy(); background.shutdownNow();
+        if (popupDialog != null) popupDialog.dismiss();
+        if (web != null) web.destroy();
         if (tts != null) tts.shutdown();
-        if (web != null) {web.destroy();}
         super.onDestroy();
     }
 }
