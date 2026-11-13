@@ -79,13 +79,20 @@ public final class MainActivity extends Activity {
 
     private void buildWebPage() {
         webPane = column();
-        LinearLayout bar = row(); bar.setPadding(dp(10), 0, dp(10), 0);
-        TextView hint = new TextView(this); hint.setText("Сайт ChatGPT. Вход выполняется на стороне OpenAI.");
+        TextView hint = new TextView(this);
+        hint.setText("Встроенный ChatGPT: вход через Google может не работать. " +
+                "Для надёжного входа открой ChatGPT в системном браузере. " +
+                "Cookies браузера не передаются в оболочку.");
         hint.setTextSize(12); hint.setTextColor(Color.DKGRAY);
-        bar.addView(hint, new LinearLayout.LayoutParams(0, -2, 1));
-        Button browser = button("Браузер");
-        browser.setOnClickListener(v -> openExternal("https://chatgpt.com/"));
-        bar.addView(browser);
+        hint.setPadding(dp(12), dp(5), dp(12), dp(5));
+        webPane.addView(hint);
+        LinearLayout bar = row(); bar.setPadding(dp(8), 0, dp(8), 0);
+        Button browser = button("Открыть в браузере");
+        browser.setOnClickListener(v -> { LocalLog.event(this, "web_open_browser"); openExternal("https://chatgpt.com/"); });
+        Button resetLogin = button("Сбросить вход");
+        resetLogin.setOnClickListener(v -> resetWebLogin());
+        bar.addView(browser, new LinearLayout.LayoutParams(0, dp(48), 1));
+        bar.addView(resetLogin, new LinearLayout.LayoutParams(0, dp(48), 1));
         webPane.addView(bar);
         web = new WebView(this);
         WebSettings s = web.getSettings();
@@ -96,7 +103,9 @@ public final class MainActivity extends Activity {
         s.setJavaScriptCanOpenWindowsAutomatically(false);
         s.setSafeBrowsingEnabled(true);
         CookieManager.getInstance().setAcceptCookie(true);
-        CookieManager.getInstance().setAcceptThirdPartyCookies(web, false);
+        // Required for cross-domain ChatGPT sign-in inside this WebView.
+        // The WebView's cookies remain separate from Chrome.
+        CookieManager.getInstance().setAcceptThirdPartyCookies(web, true);
         web.setWebViewClient(new WebViewClient() {
             @Override public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 Uri u = request.getUrl();
@@ -104,7 +113,15 @@ public final class MainActivity extends Activity {
                 if (scheme == null || host == null || !scheme.equalsIgnoreCase("https")) return true;
                 if (host.equals("chatgpt.com") || host.endsWith(".chatgpt.com") ||
                     host.equals("openai.com") || host.endsWith(".openai.com")) return false;
-                if (request.isForMainFrame()) openExternal(u.toString());
+                if (request.isForMainFrame()) {
+                    if (host.equals("accounts.google.com") ||
+                        host.equals("appleid.apple.com") ||
+                        host.equals("login.microsoftonline.com")) {
+                        LocalLog.event(MainActivity.this, "external_identity_provider");
+                        showMessage("Внешний вход не переносится в WebView. Для ChatGPT используй браузер.");
+                    }
+                    openExternal(u.toString());
+                }
                 return true;
             }
         });
@@ -125,6 +142,23 @@ public final class MainActivity extends Activity {
         web.loadUrl("https://chatgpt.com/");
         webPane.addView(web, new LinearLayout.LayoutParams(-1, 0, 1));
         pages.addView(webPane);
+    }
+
+    private void resetWebLogin() {
+        new AlertDialog.Builder(this)
+            .setTitle("Сбросить вход в веб-вкладке?")
+            .setMessage("Очистятся только данные WebView этого приложения. Сессия Chrome и аккаунт ChatGPT сохранятся.")
+            .setNegativeButton("Отмена", null)
+            .setPositiveButton("Очистить", (dialog, which) ->
+                CookieManager.getInstance().removeAllCookies(cleared ->
+                    runOnUiThread(() -> {
+                        web.clearCache(true);
+                        WebStorage.getInstance().deleteAllData();
+                        web.loadUrl("https://chatgpt.com/");
+                        LocalLog.event(this, "web_login_reset");
+                        showMessage("Данные веб-вкладки очищены");
+                    })))
+            .show();
     }
 
     private void buildTranslatorPage() {

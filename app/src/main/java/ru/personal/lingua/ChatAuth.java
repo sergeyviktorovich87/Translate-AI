@@ -59,7 +59,7 @@ final class ChatAuth {
                         .appendQueryParameter("nonce", nonce)
                         .appendQueryParameter("code_challenge_method", "S256")
                         .appendQueryParameter("code_challenge", challenge);
-                if (old == null) b.appendQueryParameter("agent_name_hint", "Личный переводчик");
+                if (old == null) b.appendQueryParameter("agent_name_hint", "Translate AI");
                 else {
                     if (old.has("id_token")) b.appendQueryParameter("id_token_hint", old.optString("id_token"));
                     if (old.has("email")) b.appendQueryParameter("login_hint", old.optString("email"));
@@ -264,7 +264,7 @@ final class ChatAuth {
         return Base64.encodeToString(data, Base64.NO_WRAP | Base64.NO_PADDING | Base64.URL_SAFE);
     }
     static String safeError(Exception e) {
-        if (e instanceof java.net.SocketTimeoutException) return "превышено время ожидания";
+        if (e instanceof java.net.SocketTimeoutException) return "время входа истекло; проверь Chrome и повтори вход";
         if (e instanceof java.net.UnknownHostException) return "нет соединения с сервером";
         if (e instanceof SecurityException) return "проверка безопасности или разрешений не прошла";
         if (e instanceof IllegalStateException) return e.getMessage();
