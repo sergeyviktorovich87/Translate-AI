@@ -51,6 +51,9 @@ public final class MainActivity extends Activity {
     private TextToSpeech tts;
     private boolean ttsReady, ruToZh = true, translatorMode = true;
     private String lastNavigationTag = "";
+    private boolean fallbackManualSend = false;
+    private TextView translatorStatus;
+    private Button translateAction;
 
     @Override public void onCreate(Bundle savedState) {
         super.onCreate(savedState);
@@ -68,20 +71,26 @@ public final class MainActivity extends Activity {
         root.setBackgroundColor(Color.rgb(247, 248, 252));
         setContentView(root);
 
-        LinearLayout tabs = row();
-        tabs.setPadding(dp(6), dp(6), dp(6), 0);
-        Button translator = button("🌐 Переводчик");
-        Button chat = button("💬 ChatGPT");
+        // Native shell header. The website remains in the same WebView on both tabs.
+        LinearLayout header = row();
+        header.setPadding(dp(10), dp(8), dp(10), dp(5));
+        TextView brand = label("Translate AI", 20);
+        brand.setTextColor(Color.rgb(20, 32, 54));
+        brand.setTypeface(null, android.graphics.Typeface.BOLD);
+        header.addView(brand, new LinearLayout.LayoutParams(0, dp(48), 1));
+        Button translator = button("Переводчик");
+        Button chat = button("Чат");
         translator.setOnClickListener(v -> showMode(true));
         chat.setOnClickListener(v -> showMode(false));
-        tabs.addView(translator, new LinearLayout.LayoutParams(0, dp(49), 1));
-        tabs.addView(chat, new LinearLayout.LayoutParams(0, dp(49), 1));
-        root.addView(tabs);
+        header.addView(translator, new LinearLayout.LayoutParams(dp(104), dp(44)));
+        header.addView(chat, new LinearLayout.LayoutParams(dp(72), dp(44)));
+        root.addView(header);
 
         translatorControls = column();
-        translatorControls.setPadding(dp(10), dp(2), dp(10), dp(4));
-        TextView note = label("Один вход. После перевода скопируй ответ в ChatGPT, нажми «📥 Ответ».", 12);
-        translatorControls.addView(note);
+        translatorControls.setPadding(dp(12), dp(2), dp(12), dp(8));
+        TextView subtitle = label("Русский ↔ 简体中文", 13);
+        subtitle.setTextColor(Color.rgb(96, 106, 127));
+        translatorControls.addView(subtitle);
         directionButton = button("Русский → 中文  ⇄");
         directionButton.setOnClickListener(v -> {
             ruToZh = !ruToZh;
@@ -101,11 +110,17 @@ public final class MainActivity extends Activity {
         LinearLayout actions = row();
         Button microphone = button("🎙 Голос");
         microphone.setOnClickListener(v -> startVoice());
-        Button translate = button("Перевести в ChatGPT");
-        translate.setOnClickListener(v -> preparePrompt());
-        actions.addView(microphone, new LinearLayout.LayoutParams(0, dp(48), 1));
-        actions.addView(translate, new LinearLayout.LayoutParams(0, dp(48), 2));
+        translateAction = button("Перевести");
+        translateAction.setTextColor(Color.WHITE);
+        translateAction.setBackgroundTintList(android.content.res.ColorStateList.valueOf(
+                Color.rgb(35, 106, 241)));
+        translateAction.setOnClickListener(v -> preparePrompt());
+        actions.addView(microphone, new LinearLayout.LayoutParams(0, dp(50), 1));
+        actions.addView(translateAction, new LinearLayout.LayoutParams(0, dp(50), 2));
         translatorControls.addView(actions);
+        translatorStatus = label("Перевод появится ниже. Ответ остаётся на странице ChatGPT.", 12);
+        translatorStatus.setTextColor(Color.rgb(92, 105, 125));
+        translatorControls.addView(translatorStatus);
         root.addView(translatorControls);
 
         // SAME WebView instance is retained between modes: one account, one cookie jar.
@@ -149,7 +164,8 @@ public final class MainActivity extends Activity {
         translatorMode = translator;
         translatorControls.setVisibility(translator ? View.VISIBLE : View.GONE);
         resultPane.setVisibility(translator && answer.length() > 0 ? View.VISIBLE : View.GONE);
-        // Do not reload: reloading can interrupt an authentication redirect.
+        // Never reload the website when changing modes; this preserves login.
+        ui.post(() -> applyWebMode());
         LocalLog.event(this, translator ? "show_translator" : "show_chat");
     }
 
@@ -189,7 +205,11 @@ public final class MainActivity extends Activity {
             || domain(host, "googleusercontent.com")
             || domain(host, "gstatic.com")
             || host != null && (host.equals("accounts.youtube.com")
-                 || host.startsWith("accounts.google.")
+                 || host.equals("accounts.google.de")
+                 || host.equals("accounts.google.ru")
+                 || host.equals("accounts.google.co.uk")
+                 || host.equals("accounts.google.co.jp")
+                 || host.equals("accounts.google.com.hk")
                  || domain(host, "microsoftonline.com")
                  || host.equals("appleid.apple.com"));
     }
@@ -223,8 +243,13 @@ public final class MainActivity extends Activity {
                 LocalLog.event(MainActivity.this, (isPopup ? "popup_" : "main_") + navTag);
                 lastNavigationTag = navTag;
             }
+            if (!isPopup && isChatHost(host)) {
+                ui.postDelayed(() -> applyWebMode(), 600);
+            }
             // Some sign-in providers open a new window; it shares cookies with the main WebView.
-            if (isPopup && isChatHost(host) && !uri.getPath().startsWith("/auth/")) {
+            String loadedPath = uri.getPath();
+            if (isPopup && isChatHost(host) &&
+                    (loadedPath == null || !loadedPath.startsWith("/auth/"))) {
                 LocalLog.event(MainActivity.this, "popup_login_returned");
                 ui.postDelayed(() -> closePopup(true), 650);
             }
@@ -289,48 +314,131 @@ public final class MainActivity extends Activity {
         });
     }
 
+    /**
+     * The native Translate button is the user's explicit send action.
+     * We never parse/copy the generated answer from the ChatGPT webpage.
+     */
     private void preparePrompt() {
         String message = source.getText().toString().trim();
-        if (message.isEmpty()) {toast("Сначала напиши или продиктуй фразу"); return;}
+        if (message.isEmpty()) { toast("Напиши или продиктуй фразу"); return; }
         String instruction = ruToZh
-            ? "Переведи с русского на упрощённый китайский. Сначала дай китайский перевод, "
-              + "затем пиньинь с тонами, затем краткое объяснение по-русски. "
-              + "Без вступления и лишнего текста.\nИсходный текст:\n"
-            : "Переведи с китайского на русский. Сначала дай русский перевод, "
-              + "затем пиньинь оригинала с тонами, затем краткое объяснение по-русски. "
-              + "Без вступления и лишнего текста.\nИсходный текст:\n";
-        String fullPrompt = instruction + message;
-        copyTextQuiet(fullPrompt);
-        LocalLog.event(this, "prompt_prepared");
-        Uri page = null;
-        try {page = Uri.parse(web.getUrl());} catch (Exception ignored) {}
-        if (page == null || !isChatHost(page.getHost())) {
-            toast("Запрос скопирован. Войди в ChatGPT, вставь текст и отправь.");
+            ? "Переведи текст с русского на упрощённый китайский. Ответ строго в формате:\n"
+              + "1) Китайский перевод\n2) Пиньинь с тонами\n3) Краткое объяснение по-русски."
+              + "\nБез приветствий, рассуждений и дополнительных вопросов.\nТекст:\n"
+            : "Переведи текст с упрощённого китайского на русский. Ответ строго в формате:\n"
+              + "1) Русский перевод\n2) Пиньинь исходной фразы с тонами"
+              + "\n3) Краткое объяснение по-русски. Без вступлений и лишнего текста.\nТекст:\n";
+        String prompt = instruction + message;
+        copyTextQuiet(prompt); // manual fallback if ChatGPT changes its composer
+        LocalLog.event(this, "translator_submit_requested");
+        Uri url;
+        try { url = Uri.parse(web.getUrl()); }
+        catch (Exception ignored) { url = null; }
+        if (url == null || !isChatHost(url.getHost())) {
+            translatorStatus.setText("Войди в ChatGPT. Запрос уже скопирован.");
+            toast("Открой ChatGPT, вставь текст и отправь");
             return;
         }
-        // User-triggered convenience: prefill the site's input. No response scraping.
-        String js = "(function() {"
-          + "const box=document.querySelector('#prompt-textarea')"
-          + "||document.querySelector('div[contenteditable=\"true\"][role=\"textbox\"]')"
-          + "||document.querySelector('div[contenteditable=\"true\"]')"
-          + "||document.querySelector('textarea');"
-          + "if(!box)return false;"
-          + "const v=" + JSONObject.quote(fullPrompt) + ";"
-          + "box.focus();"
-          + "if(box.tagName==='TEXTAREA'){const d=Object.getOwnPropertyDescriptor("
-          + "HTMLTextAreaElement.prototype,'value');d.set.call(box,v);}"
-          + "else {box.textContent=v;}"
-          + "box.dispatchEvent(new Event('input',{bubbles:true}));"
-          + "return true;})()";
-        web.evaluateJavascript(js, ok -> {
-            if ("true".equals(ok)) {
-                LocalLog.event(this, "prompt_prefilled");
-                toast("Текст готов в ChatGPT. Нажми отправку.");
+
+        translateAction.setEnabled(false);
+        translatorStatus.setText("Отправляем запрос…");
+        fallbackManualSend = false;
+        showWebComposer(true); // make the real input available for filling
+
+        // A strictly scoped site interaction after the user tapped Translate.
+        // Do not access network, user identity, cookies, or output in JavaScript.
+        String fill = "(function(){"
+            + "const box=document.querySelector('#prompt-textarea')"
+            + "||document.querySelector('div[contenteditable=\"true\"][role=\"textbox\"]')"
+            + "||document.querySelector('textarea');"
+            + "if(!box)return 'composer_missing';"
+            + "let v=" + JSONObject.quote(prompt) + ";"
+            + "box.focus();"
+            + "if(box.tagName==='TEXTAREA'){"
+            + "const d=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value');"
+            + "if(d&&d.set)d.set.call(box,v);else box.value=v;"
+            + "}else{"
+            + "const selection=window.getSelection();"
+            + "const range=document.createRange();range.selectNodeContents(box);"
+            + "selection.removeAllRanges();selection.addRange(range);"
+            + "if(!document.execCommand('insertText',false,v))box.textContent=v;"
+            + "}"
+            + "box.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:v}));"
+            + "return 'prepared';})()";
+        web.evaluateJavascript(fill, result -> {
+            if (!"\"prepared\"".equals(result)) {
+                manualFallback("Поле ChatGPT изменилось. Запрос скопирован, вставь вручную.");
+                LocalLog.event(this, "translator_composer_unavailable");
+                return;
+            }
+            LocalLog.event(this, "translator_prompt_prepared");
+            ui.postDelayed(() -> trySendPrompt(), 450);
+        });
+    }
+
+    private void trySendPrompt() {
+        // Limit the click to known ChatGPT send controls. No generic buttons.
+        String click = "(function(){"
+            + "const box=document.querySelector('#prompt-textarea')"
+            + "||document.querySelector('div[contenteditable=\"true\"][role=\"textbox\"]')"
+            + "||document.querySelector('textarea');"
+            + "if(!box || !(box.value||box.innerText||box.textContent||'').trim())"
+            + "return 'empty_composer';"
+            + "const selectors=['button[data-testid=\"send-button\"]',"
+            + "'button[data-testid=\"composer-send-button\"]',"
+            + "'button[aria-label=\"Send prompt\"]',"
+            + "'button[aria-label=\"Отправить сообщение\"]'];"
+            + "let send=null;"
+            + "for(const selector of selectors){let found=document.querySelector(selector);"
+            + "if(found&&!found.disabled){send=found;break;}}"
+            + "if(!send)return 'send_button_unavailable';"
+            + "send.click();return 'clicked';})()";
+        web.evaluateJavascript(click, result -> {
+            translateAction.setEnabled(true);
+            if ("\"clicked\"".equals(result)) {
+                LocalLog.event(this, "translator_send_clicked");
+                translatorStatus.setText("Запрос отправлен в ChatGPT. Ответ появится ниже.");
+                ui.postDelayed(() -> { if (translatorMode && !fallbackManualSend)
+                    applyWebMode(); }, 1250);
             } else {
-                LocalLog.event(this, "prompt_prefill_unavailable");
-                toast("Запрос скопирован. Вставь его в ChatGPT и отправь.");
+                LocalLog.event(this, "translator_send_unavailable");
+                manualFallback("Запрос подготовлен. Нажми отправку в ChatGPT ниже.");
             }
         });
+    }
+
+    private void manualFallback(String reason) {
+        fallbackManualSend = true;
+        translateAction.setEnabled(true);
+        translatorStatus.setText(reason);
+        showWebComposer(true);
+        toast(reason);
+    }
+
+    private void applyWebMode() {
+        if (web == null) return;
+        Uri uri;
+        try {uri=Uri.parse(web.getUrl());}
+        catch (Exception e) {return;}
+        if (uri == null || !isChatHost(uri.getHost())) return;
+        showWebComposer(!translatorMode || fallbackManualSend);
+    }
+
+    private void showWebComposer(boolean show) {
+        if (web == null) return;
+        // Pure local presentation change. Never hide sign-in controls,
+        // and allow Chat mode or manual fallback to restore the website.
+        String code = "(function(){"
+            + "if(!location.hostname.endsWith('chatgpt.com'))return;"
+            + "let node=document.getElementById('translate-ai-composer-style');"
+            + (show
+                ? "if(node)node.remove();"
+                : "if(!node){node=document.createElement('style');"
+                + "node.id='translate-ai-composer-style';"
+                + "node.textContent='form:has(#prompt-textarea){display:none!important}';"
+                + "document.head.appendChild(node);}")
+            + "})()";
+        web.evaluateJavascript(code, null);
     }
 
     private void startVoice() {
