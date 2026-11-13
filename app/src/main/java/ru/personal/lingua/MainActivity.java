@@ -45,8 +45,8 @@ public final class MainActivity extends Activity {
     private final Handler ui = new Handler(Looper.getMainLooper());
     private WebView web, popup;
     private Dialog popupDialog;
-    private LinearLayout translatorControls;
-    private EditText source;
+    private LinearLayout translatorControls, resultPane;
+    private EditText source, answer;
     private Button directionButton;
     private TextToSpeech tts;
     private boolean ttsReady, ruToZh = true, translatorMode = true;
@@ -80,7 +80,7 @@ public final class MainActivity extends Activity {
 
         translatorControls = column();
         translatorControls.setPadding(dp(10), dp(2), dp(10), dp(4));
-        TextView note = label("Один вход в ChatGPT. Ответ показывается в чате ниже.", 12);
+        TextView note = label("Один вход. После перевода скопируй ответ в ChatGPT, нажми «📥 Ответ».", 12);
         translatorControls.addView(note);
         directionButton = button("Русский → 中文  ⇄");
         directionButton.setOnClickListener(v -> {
@@ -115,30 +115,40 @@ public final class MainActivity extends Activity {
         web.setWebChromeClient(new BrowserChrome());
         root.addView(web, new LinearLayout.LayoutParams(-1, 0, 1));
 
+        resultPane = column();
+        resultPane.setPadding(dp(10), dp(2), dp(10), dp(3));
+        resultPane.addView(label("Результат перевода (вставь скопированный ответ)", 12));
+        answer = new EditText(this);
+        answer.setTextSize(18);
+        answer.setHint("Скопируй ответ в ChatGPT, затем нажми «📥 Ответ»");
+        answer.setSingleLine(false);
+        answer.setMinLines(2);
+        answer.setMaxLines(5);
+        resultPane.addView(answer, new LinearLayout.LayoutParams(-1, dp(95)));
+        root.addView(resultPane);
+        resultPane.setVisibility(View.GONE);
+
         LinearLayout bottom = row();
         bottom.setPadding(dp(5), dp(2), dp(5), dp(5));
-        Button copy = button("📋 Текст");
-        copy.setOnClickListener(v -> {
-            String text = source.getText().toString();
-            if (text.trim().isEmpty()) {toast("Нет текста для копирования"); return;}
-            copyText(text);
-        });
-        Button speaker = button("🔊 Перевод");
-        speaker.setOnClickListener(v -> speakClipboard());
+        Button paste = button("📥 Ответ");
+        paste.setOnClickListener(v -> pasteAnswer());
+        Button copy = button("📋 Копировать");
+        copy.setOnClickListener(v -> copyAnswer());
+        Button speaker = button("🔊 Слушать");
+        speaker.setOnClickListener(v -> speakAnswer());
         Button logs = button("Логи");
         logs.setOnClickListener(v -> exportLogs());
-        Button reload = button("↻");
-        reload.setOnClickListener(v -> web.reload());
-        bottom.addView(copy, new LinearLayout.LayoutParams(0, dp(46), 1));
+        bottom.addView(paste, new LinearLayout.LayoutParams(0, dp(46), 1));
+        bottom.addView(copy, new LinearLayout.LayoutParams(0, dp(46), 1.15f));
         bottom.addView(speaker, new LinearLayout.LayoutParams(0, dp(46), 1));
-        bottom.addView(logs, new LinearLayout.LayoutParams(0, dp(46), 1));
-        bottom.addView(reload, new LinearLayout.LayoutParams(0, dp(46), 0.55f));
+        bottom.addView(logs, new LinearLayout.LayoutParams(0, dp(46), 0.55f));
         root.addView(bottom);
     }
 
     private void showMode(boolean translator) {
         translatorMode = translator;
         translatorControls.setVisibility(translator ? View.VISIBLE : View.GONE);
+        resultPane.setVisibility(translator && answer.length() > 0 ? View.VISIBLE : View.GONE);
         // Do not reload: reloading can interrupt an authentication redirect.
         LocalLog.event(this, translator ? "show_translator" : "show_chat");
     }
@@ -349,23 +359,43 @@ public final class MainActivity extends Activity {
         }
     }
 
-    private void speakClipboard() {
+    private void pasteAnswer() {
         ClipboardManager manager = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
-        if (manager == null || !manager.hasPrimaryClip() || manager.getPrimaryClip() == null
-                || manager.getPrimaryClip().getItemCount() == 0) {
-            toast("Сначала скопируй перевод в ChatGPT"); return;
+        if (manager == null || !manager.hasPrimaryClip() || manager.getPrimaryClip() == null ||
+                manager.getPrimaryClip().getItemCount() == 0) {
+            toast("Сначала скопируй ответ из ChatGPT"); return;
         }
-        CharSequence text = manager.getPrimaryClip().getItemAt(0).coerceToText(this);
-        if (text == null || text.length() == 0) {
-            toast("Буфер обмена пуст"); return;
+        // Read only plain text from the clipboard on a direct user click.
+        CharSequence content = manager.getPrimaryClip().getItemAt(0).getText();
+        if (content == null || content.length() == 0) {
+            toast("В буфере нет текста. Скопируй перевод в ChatGPT."); return;
         }
+        if (content.length() > 12000) {
+            toast("Ответ слишком длинный для этого поля"); return;
+        }
+        showMode(true);
+        answer.setText(content);
+        resultPane.setVisibility(View.VISIBLE);
+        LocalLog.event(this, "answer_pasted_from_clipboard");
+    }
+
+    private void copyAnswer() {
+        String text = answer.getText().toString();
+        if (text.trim().isEmpty()) {toast("Сначала вставь результат"); return;}
+        copyText(text);
+        LocalLog.event(this, "answer_copied");
+    }
+
+    private void speakAnswer() {
+        String text = answer.getText().toString().trim();
+        if (text.isEmpty()) {toast("Сначала вставь результат"); return;}
         if (!ttsReady) {toast("Озвучивание пока недоступно"); return;}
         int status = tts.setLanguage(ruToZh ? Locale.SIMPLIFIED_CHINESE : new Locale("ru", "RU"));
         if (status == TextToSpeech.LANG_MISSING_DATA || status == TextToSpeech.LANG_NOT_SUPPORTED) {
             toast("Установи голос выбранного языка в настройках Android"); return;
         }
-        tts.speak(text.toString(), TextToSpeech.QUEUE_FLUSH, null, "translate_ai_clipboard");
-        LocalLog.event(this, "speech_playback_started");
+        tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "translate_ai_answer");
+        LocalLog.event(this, "answer_speech_started");
     }
 
     private void copyTextQuiet(String text) {
