@@ -6,3 +6,18 @@ app/build/
 *.apk
 *.jks
 *.keystore
+
+# Signing material and credentials (never commit)
+*.p12
+*.pfx
+*.pem
+*.key
+*.asc
+*.env
+.env.*
+!*.env.example
+secrets.properties
+keystore.properties
+google-services.json
+*.mobileprovision
+*.log
