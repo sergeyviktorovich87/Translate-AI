@@ -39,14 +39,14 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          cp app/build/outputs/apk/debug/app-debug.apk dist/Translate-AI-v0.3.0-alpha.apk
+          cp app/build/outputs/apk/debug/app-debug.apk dist/Translate-AI-v0.4.0-alpha.apk
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -f dist/Translate-AI-v0.3.0-alpha.apk
+          git add -f dist/Translate-AI-v0.4.0-alpha.apk
           if git diff --cached --quiet; then
             echo "APK unchanged"
           else
-            git commit -m "build: publish Android 0.3.0-alpha debug APK [skip ci]"
+            git commit -m "build: publish Android 0.4.0-alpha debug APK [skip ci]"
             # The main branch may have advanced since this workflow was triggered.
             # Rebase the generated APK commit instead of force-pushing.
             git fetch origin main
